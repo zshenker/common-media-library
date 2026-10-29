@@ -8,6 +8,15 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- An event target can have a `sink` instead of a `url`. A `CmcdEventSink` receives each batch as prepared CMCD data and delivers the batch over a transport that is not HTTP, for example Media over QUIC. A sink resolves with `{ gone: true }` to stop reporting for the rest of the session, like an HTTP 410 response. A rejected sink promise queues the batch again. See the [RFC](https://github.com/streaming-video-technology-alliance/common-media-library/blob/main/rfc/cmcd-event-sink.md).
+- The `batchInterval` option of an event target sends a batch when its first report has waited the given number of seconds. If `batchSize` is also set, the first limit that the batch reaches sends the batch.
+
+### Changed
+
+- The `url` property of `CmcdEventReportConfig` is now optional in the type, because a target has either a `url` or a `sink`. Code that only creates configurations needs no change. Code that reads `url` from a `CmcdEventReportConfig` value now gets `string | undefined`. Narrow the value with `if (config.url)` before you use it.
+
 ## [2.8.4] - 2026-10-26
 
 ### Changed

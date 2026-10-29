@@ -1,6 +1,8 @@
 import type {
 	Cmcd,
+	CmcdEventReportConfig,
 	CmcdEventReportTransform,
+	CmcdEventSink,
 	CmcdKey,
 	CmcdReporterConfig,
 	CmcdRequestProvenance,
@@ -5086,6 +5088,384 @@ describe('CmcdReporter', () => {
 			equal(requests.length, 2)
 			equal(requests[0].url, 'https://example.com/cmcd-1')
 			equal(requests[1].url, 'https://example.com/cmcd-2')
+		})
+	})
+
+	describe('event sinks', () => {
+		it('provides a valid sink example', async () => {
+			// #region example-sink
+			const published: { T: number; data: Cmcd }[] = []
+
+			// The sink moves `ts` out of each report, for example into the
+			// time index of a Media over QUIC event timeline record.
+			const sink: CmcdEventSink = reports => {
+				for (const { ts, ...data } of reports) {
+					published.push({ T: ts as number, data })
+				}
+
+				return Promise.resolve()
+			}
+
+			const reporter = new CmcdReporter({
+				sid: 'session-id',
+				eventTargets: [
+					{
+						sink,
+						events: [CmcdEventType.PLAY_STATE],
+						enabledKeys: ['sid', 'sta', 'bl'],
+					},
+				],
+			})
+
+			reporter.update({ sta: 'p', bl: [4100] })
+			// #endregion example-sink
+
+			await new Promise(resolve => setTimeout(resolve, 10))
+
+			equal(published.length, 1)
+			equal(typeof published[0].T, 'number')
+			deepEqual(Object.keys(published[0].data), ['bl', 'e', 'sid', 'sta', 'v'])
+			deepEqual(published[0].data.e, new SfToken('ps'))
+			deepEqual(published[0].data.bl, [4100])
+		})
+
+		it('delivers prepared reports to the sink and sends no HTTP request', async () => {
+			const { requester, requests } = createMockRequester()
+			const batches: (readonly Cmcd[])[] = []
+			const sink: CmcdEventSink = reports => {
+				batches.push(reports)
+				return Promise.resolve()
+			}
+
+			const reporter = new CmcdReporter(
+				createConfig({
+					eventTargets: [
+						{
+							sink,
+							events: [CmcdEventType.ERROR],
+							enabledKeys: [...EVENT_KEYS],
+							batchSize: 2,
+						},
+					],
+				}),
+				requester,
+			)
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			reporter.recordEvent(CmcdEventType.ERROR)
+
+			await new Promise(resolve => setTimeout(resolve, 10))
+
+			equal(requests.length, 0)
+			equal(batches.length, 1)
+			equal(batches[0].length, 2)
+			deepEqual(
+				batches[0].map(report => report.sn),
+				[0, 1],
+			)
+			ok(batches[0].every(report => report.sid === 'test-session' && report.v === 2))
+		})
+
+		it('throws at record time for a value that cannot serialize', async () => {
+			const batches: (readonly Cmcd[])[] = []
+			const reporter = new CmcdReporter({
+				sid: 's1',
+				eventTargets: [
+					{
+						sink: reports => {
+							batches.push(reports)
+							return Promise.resolve()
+						},
+						events: [CmcdEventType.ERROR],
+						enabledKeys: [...EVENT_KEYS, 'com.example-bad'] as CmcdKey[],
+					},
+				],
+			})
+
+			throws(() =>
+				reporter.recordEvent(CmcdEventType.ERROR, {
+					'com.example-bad': [{ junk: true }],
+				} as unknown as Partial<Cmcd>),
+			)
+
+			await new Promise(resolve => setTimeout(resolve, 10))
+			equal(batches.length, 0)
+		})
+
+		it('re-queues a batch when the sink rejects and sends it on the next pass', async () => {
+			const batches: (readonly Cmcd[])[] = []
+			let calls = 0
+			const sink: CmcdEventSink = reports => {
+				batches.push(reports)
+				return calls++ === 0 ? Promise.reject(new Error('offline')) : Promise.resolve()
+			}
+
+			const reporter = new CmcdReporter(
+				createConfig({
+					eventTargets: [{ sink, events: [CmcdEventType.ERROR], enabledKeys: [...EVENT_KEYS] }],
+				}),
+			)
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await new Promise(resolve => setTimeout(resolve, 10))
+			equal(batches.length, 1)
+
+			reporter.flush()
+			await new Promise(resolve => setTimeout(resolve, 10))
+
+			equal(batches.length, 2)
+			equal(batches[1][0].sn, 0)
+		})
+
+		it('re-queues a batch when the sink throws synchronously', async () => {
+			let calls = 0
+			const delivered: Cmcd[] = []
+			const sink: CmcdEventSink = reports => {
+				if (calls++ === 0) {
+					throw new Error('boom')
+				}
+				delivered.push(...reports)
+				return Promise.resolve()
+			}
+
+			const reporter = new CmcdReporter(
+				createConfig({
+					eventTargets: [{ sink, events: [CmcdEventType.ERROR], enabledKeys: [...EVENT_KEYS] }],
+				}),
+			)
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await new Promise(resolve => setTimeout(resolve, 10))
+			reporter.flush()
+			await new Promise(resolve => setTimeout(resolve, 10))
+
+			equal(delivered.length, 1)
+		})
+
+		it('stops reporting to every target with the same sink when the sink returns gone', async () => {
+			const gone: Cmcd[] = []
+			const other: Cmcd[] = []
+			const { requester, requests } = createMockRequester()
+			const goneSink: CmcdEventSink = reports => {
+				gone.push(...reports)
+				return Promise.resolve({ gone: true })
+			}
+			const otherSink: CmcdEventSink = reports => {
+				other.push(...reports)
+				return Promise.resolve()
+			}
+
+			const reporter = new CmcdReporter(
+				createConfig({
+					eventTargets: [
+						{ sink: goneSink, events: [CmcdEventType.ERROR], enabledKeys: [...EVENT_KEYS] },
+						{ sink: goneSink, events: [CmcdEventType.ERROR], enabledKeys: ['sid'] },
+						{ sink: otherSink, events: [CmcdEventType.ERROR], enabledKeys: [...EVENT_KEYS] },
+						{
+							url: 'https://example.com/cmcd',
+							events: [CmcdEventType.ERROR],
+							enabledKeys: [...EVENT_KEYS],
+						},
+					],
+				}),
+				requester,
+			)
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await new Promise(resolve => setTimeout(resolve, 10))
+
+			equal(gone.length, 2)
+			equal(other.length, 1)
+			equal(requests.length, 1)
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await new Promise(resolve => setTimeout(resolve, 10))
+
+			// Both targets of the gone sink are silent. The others continue.
+			equal(gone.length, 2)
+			equal(other.length, 2)
+			equal(requests.length, 2)
+
+			// A new session lifts the suppression.
+			reporter.update({ sid: 'new-session' })
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await new Promise(resolve => setTimeout(resolve, 10))
+
+			equal(gone.length, 4)
+			equal(gone[3].sid, 'new-session')
+		})
+
+		it('does not silence sink targets when an HTTP collector returns 410', async () => {
+			const delivered: Cmcd[] = []
+			const { requester } = createMockRequester(410)
+
+			const reporter = new CmcdReporter(
+				createConfig({
+					eventTargets: [
+						{
+							sink: reports => {
+								delivered.push(...reports)
+								return Promise.resolve()
+							},
+							events: [CmcdEventType.ERROR],
+							enabledKeys: [...EVENT_KEYS],
+						},
+						{
+							url: 'https://example.com/cmcd',
+							events: [CmcdEventType.ERROR],
+							enabledKeys: [...EVENT_KEYS],
+						},
+					],
+				}),
+				requester,
+			)
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await new Promise(resolve => setTimeout(resolve, 10))
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await new Promise(resolve => setTimeout(resolve, 10))
+
+			equal(delivered.length, 2)
+		})
+
+		it('rejects a target with both a url and a sink at compile time', () => {
+			const sink: CmcdEventSink = () => Promise.resolve()
+			// @ts-expect-error A target has either a url or a sink, never both.
+			const target: CmcdEventReportConfig = {
+				url: 'https://example.com/cmcd',
+				sink,
+				events: [CmcdEventType.ERROR],
+			}
+
+			ok(target)
+		})
+
+		it('ignores a target that has neither a url nor a sink', async () => {
+			const { requester, requests } = createMockRequester()
+			const reporter = new CmcdReporter(
+				createConfig({
+					eventTargets: [{ events: [CmcdEventType.ERROR], enabledKeys: [...EVENT_KEYS] } as never],
+				}),
+				requester,
+			)
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await new Promise(resolve => setTimeout(resolve, 10))
+
+			equal(requests.length, 0)
+		})
+	})
+
+	describe('batch interval', () => {
+		function createBatchReporter(batchSize?: number) {
+			const { requester, requests } = createMockRequester()
+			const reporter = new CmcdReporter(
+				createConfig({
+					eventTargets: [
+						{
+							url: 'https://example.com/cmcd',
+							events: [CmcdEventType.ERROR],
+							enabledKeys: [...EVENT_KEYS],
+							batchSize,
+							batchInterval: 60,
+						},
+					],
+				}),
+				requester,
+			)
+
+			return { reporter, requests }
+		}
+
+		it('sends a partial batch when the batch interval ends', async () => {
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+			const { reporter, requests } = createBatchReporter()
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			vi.advanceTimersByTime(30_000)
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await Promise.resolve()
+
+			// Without a batchSize, the batch has no size limit.
+			equal(requests.length, 0)
+
+			// The time limit started with the first report.
+			vi.advanceTimersByTime(30_000)
+			await Promise.resolve()
+
+			equal(requests.length, 1)
+			equal((requests[0].body as string).split('\n').length, 2)
+		})
+
+		it('sends the batch at batchSize and starts a new time limit for the next batch', async () => {
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+			const { reporter, requests } = createBatchReporter(2)
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			vi.advanceTimersByTime(50_000)
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await Promise.resolve()
+
+			equal(requests.length, 1)
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+
+			// The first time limit was cancelled with the size-limited send.
+			vi.advanceTimersByTime(10_000)
+			await Promise.resolve()
+			equal(requests.length, 1)
+
+			vi.advanceTimersByTime(50_000)
+			await Promise.resolve()
+			equal(requests.length, 2)
+			ok((requests[1].body as string).includes('sn=2'))
+		})
+
+		it('cancels the time limit when the batch is flushed', async () => {
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+			const { reporter, requests } = createBatchReporter()
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			reporter.flush()
+			await Promise.resolve()
+			equal(requests.length, 1)
+			equal(vi.getTimerCount(), 0)
+		})
+
+		it('drains the batch of an ended session when the sid changes', async () => {
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+			const { reporter, requests } = createBatchReporter()
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			reporter.update({ sid: 'new-session' })
+			await Promise.resolve()
+
+			equal(requests.length, 1)
+			ok((requests[0].body as string).includes('sid="test-session"'))
+			equal(vi.getTimerCount(), 0)
+		})
+
+		it('ignores a batch interval that is not a positive number', async () => {
+			const { requester, requests } = createMockRequester()
+			const reporter = new CmcdReporter(
+				createConfig({
+					eventTargets: [
+						{
+							url: 'https://example.com/cmcd',
+							events: [CmcdEventType.ERROR],
+							enabledKeys: [...EVENT_KEYS],
+							batchInterval: -5,
+						},
+					],
+				}),
+				requester,
+			)
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await new Promise(resolve => setTimeout(resolve, 10))
+
+			// The default batchSize of 1 applies.
+			equal(requests.length, 1)
 		})
 	})
 

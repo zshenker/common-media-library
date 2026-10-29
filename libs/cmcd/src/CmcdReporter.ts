@@ -6,7 +6,7 @@ import { CMCD_REQUEST_PROVENANCE } from './CMCD_REQUEST_PROVENANCE.ts'
 import { CMCD_V2 } from './CMCD_V2.ts'
 import type { Cmcd } from './Cmcd.ts'
 import type { CmcdEncodeOptions } from './CmcdEncodeOptions.ts'
-import type { CmcdEventReportConfig } from './CmcdEventReportConfig.ts'
+import type { CmcdEventReportConfig, CmcdEventReportDestination } from './CmcdEventReportConfig.ts'
 import {
 	CMCD_EVENT_BACKGROUNDED_MODE,
 	CMCD_EVENT_CUSTOM_EVENT,
@@ -47,6 +47,7 @@ type CmcdEventReportConfigNormalized<C> = CmcdEventReportConfig<C> &
 		events: CmcdEventType[]
 		interval: number
 		batchSize: number
+		batchInterval: number
 	}
 
 type CmcdReporterConfigNormalized<C> = CmcdReporterConfig<C> &
@@ -324,17 +325,39 @@ function createCmcdReporterConfig<C>(
 		sessionRetention: sessionRetention >= 0 ? sessionRetention : 2,
 		// Apply target config defaults
 		eventTargets: eventTargets.reduce((acc, target) => {
-			if (target?.url && target.events?.length) {
-				acc.push({
-					version: target.version || CMCD_V2,
-					enabledKeys: target.enabledKeys?.slice() || [],
-					url: target.url,
-					events: target.events.slice(),
-					interval: target.interval ?? CMCD_DEFAULT_TIME_INTERVAL,
-					batchSize: target.batchSize || 1,
-					transform: target.transform,
-				})
+			if (!target?.events?.length) {
+				return acc
 			}
+
+			// A sink takes precedence over a URL, so a target never has both.
+			const destination: CmcdEventReportDestination | undefined =
+				typeof target.sink === 'function'
+					? { sink: target.sink }
+					: target.url
+						? { url: target.url }
+						: undefined
+
+			if (!destination) {
+				return acc
+			}
+
+			const batchInterval =
+				typeof target.batchInterval === 'number' && target.batchInterval > 0
+					? target.batchInterval
+					: 0
+
+			acc.push({
+				...destination,
+				version: target.version || CMCD_V2,
+				enabledKeys: target.enabledKeys?.slice() || [],
+				events: target.events.slice(),
+				interval: target.interval ?? CMCD_DEFAULT_TIME_INTERVAL,
+				// A time limit alone means the batch has no size limit.
+				batchSize: target.batchSize || (batchInterval ? Infinity : 1),
+				batchInterval,
+				transform: target.transform,
+			})
+
 			return acc
 		}, [] as CmcdEventReportConfigNormalized<C>[]),
 	}
@@ -345,14 +368,28 @@ type CmcdTarget = {
 	msdSent: boolean
 }
 
+/**
+ * One queued event report: the prepared data that a sink receives, and the
+ * encoded line that an HTTP collector receives.
+ */
+type CmcdQueuedReport = {
+	data: Cmcd
+	line: string
+}
+
 type CmcdEventTarget = CmcdTarget & {
 	/**
-	 * Complete, encoded report lines not yet sent. Encoding happens at queue
-	 * time, so a value that cannot serialize throws inside the recording call.
-	 * Later mutation of the source values cannot change a queued line.
+	 * Complete reports not yet sent. Encoding happens at queue time, so a
+	 * value that cannot serialize throws inside the recording call. Later
+	 * mutation of the source values cannot change a queued report.
 	 */
-	queue: string[]
+	queue: CmcdQueuedReport[]
 	disposed: boolean
+
+	/**
+	 * The timer that sends a partial batch when `batchInterval` ends.
+	 */
+	batchTimer?: ReturnType<typeof setTimeout>
 }
 
 /**
@@ -963,7 +1000,8 @@ export class CmcdReporter<C = Record<string, unknown>> {
 			delete report.msd
 		}
 
-		target.queue.push(encodeCmcd(report, createEncodingOptions(CMCD_EVENT_MODE, config)))
+		const data = prepareCmcdData(report, createEncodingOptions(CMCD_EVENT_MODE, config))
+		target.queue.push({ data, line: encodePreparedCmcd(data) })
 	}
 
 	/**
@@ -1299,28 +1337,7 @@ export class CmcdReporter<C = Record<string, unknown>> {
 			const drain = flush || session !== this.session
 
 			session.eventTargets.forEach((target, config) => {
-				const { queue } = target
-
-				// A disposed target's queue can be non-empty again if a failed
-				// batch was re-queued after disposal; it must stay unsent.
-				if (target.disposed || !queue.length) {
-					return
-				}
-
-				if (queue.length < config.batchSize && !drain) {
-					return
-				}
-
-				const deleteCount = drain ? queue.length : config.batchSize
-				const events = queue.splice(0, deleteCount)
-				this.sendEventReport(session, config, events).catch(() => {
-					// Re-queue events that failed to send. The target belongs
-					// to the batch's own session, so a failure after a session
-					// change re-queues there, never into the current session.
-					target.queue.unshift(...events)
-				})
-
-				reprocess ||= queue.length > 0
+				reprocess = this.processEventTarget(session, target, config, drain) || reprocess
 			})
 		})
 
@@ -1330,24 +1347,83 @@ export class CmcdReporter<C = Record<string, unknown>> {
 	}
 
 	/**
+	 * Sends the ready batch of one event target. If the batch is not ready
+	 * and the target has a `batchInterval`, the method starts the batch timer.
+	 * Returns whether reports remain in the queue after the send.
+	 */
+	private processEventTarget(
+		session: CmcdSession<C>,
+		target: CmcdEventTarget,
+		config: CmcdEventReportConfigNormalized<C>,
+		drain: boolean,
+	): boolean {
+		const { queue } = target
+
+		// A disposed target's queue can be non-empty again if a failed
+		// batch was re-queued after disposal; it must stay unsent.
+		if (target.disposed || !queue.length) {
+			return false
+		}
+
+		if (queue.length < config.batchSize && !drain) {
+			// Only an archived session drains, and an archived session always
+			// drains, so the timer only ever reports into its own session.
+			if (config.batchInterval && target.batchTimer === undefined) {
+				target.batchTimer = setTimeout(() => {
+					target.batchTimer = undefined
+					this.processEventTarget(session, target, config, true)
+				}, config.batchInterval * 1000)
+			}
+
+			return false
+		}
+
+		// The next batch starts its own time limit with its first report.
+		clearTimeout(target.batchTimer)
+		target.batchTimer = undefined
+
+		const deleteCount = drain ? queue.length : config.batchSize
+		const reports = queue.splice(0, deleteCount)
+		this.sendEventReport(session, config, reports).catch(() => {
+			// Re-queue events that failed to send. The target belongs
+			// to the batch's own session, so a failure after a session
+			// change re-queues there, never into the current session.
+			target.queue.unshift(...reports)
+		})
+
+		return queue.length > 0
+	}
+
+	/**
 	 * Sends an event report. The reporter calls this method when a batch is
 	 * ready.
 	 *
 	 * @param config - The target config to send the event report to.
-	 * @param data - The encoded report lines to send in the event report.
+	 * @param reports - The queued reports to send in the event report.
 	 */
 	private async sendEventReport(
 		session: CmcdSession<C>,
 		config: CmcdEventReportConfigNormalized<C>,
-		data: string[],
+		reports: CmcdQueuedReport[],
 	): Promise<void> {
+		if (config.sink) {
+			// A rejection propagates, so the caller re-queues the batch.
+			const result = await config.sink(reports.map(report => report.data))
+
+			if (result?.gone === true) {
+				this.disposeEventTarget(session, config)
+			}
+
+			return
+		}
+
 		const response = await this.requester({
 			url: config.url,
 			method: 'POST',
 			headers: {
 				'Content-Type': CMCD_MIME_TYPE,
 			},
-			body: data.join('\n'),
+			body: reports.map(report => report.line).join('\n'),
 		})
 
 		const { status } = response
@@ -1377,7 +1453,8 @@ export class CmcdReporter<C = Record<string, unknown>> {
 	 * Silences an event target URL for the remainder of its session after the
 	 * collector signals that the target is gone (HTTP 410). The method clears
 	 * the queues and blocks further enqueues for every config in the session
-	 * that reports to the URL (the CTA-5004-B suppression scope). For the
+	 * that reports to the URL (the CTA-5004-B suppression scope). A sink that
+	 * resolves with `gone` silences every config with the same sink. For the
 	 * current session, the method also cancels those configs' timers. A session
 	 * started after the disposal gets new target state and is unaffected.
 	 */
@@ -1386,12 +1463,18 @@ export class CmcdReporter<C = Record<string, unknown>> {
 		config: CmcdEventReportConfigNormalized<C>,
 	): void {
 		session.eventTargets.forEach((target, sibling) => {
-			if (sibling.url !== config.url || target.disposed) {
+			const sameDestination = config.sink
+				? sibling.sink === config.sink
+				: !sibling.sink && sibling.url === config.url
+
+			if (!sameDestination || target.disposed) {
 				return
 			}
 
 			target.disposed = true
 			target.queue.length = 0
+			clearTimeout(target.batchTimer)
+			target.batchTimer = undefined
 
 			// The timer belongs to the live session only; an archived session's
 			// disposal is bookkeeping and must not silence current reporting.

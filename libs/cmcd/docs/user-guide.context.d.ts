@@ -6,6 +6,7 @@ declare const request: import('@svta/cml-utils').HttpRequest & {
 	customData: Record<symbol, unknown>
 }
 declare const response: import('@svta/cml-utils').HttpResponse
+declare const socket: WebSocket
 declare function axios(config: {
 	url: string
 	method?: string

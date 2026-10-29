@@ -779,6 +779,63 @@ const reporter = new CmcdReporter(
 );
 ```
 
+## Custom Event Destinations
+
+An event target sends its reports to a collector `url` as HTTP POST requests. To send event reports over a transport that is not HTTP, give the target a `sink` instead of a `url`. Examples of such transports are WebSocket and Media over QUIC. A target has either a `url` or a `sink`, never both.
+
+The reporter calls the sink with each batch of reports. Each report is prepared CMCD data, in the same form that `prepareCmcdData` returns. The reporter has already applied `enabledKeys`, the `transform`, and the session keys. The timestamp is in its own key, `ts`, so the sink can move it into the time index of its transport.
+
+```typescript
+import { CmcdEventType, CmcdReporter } from "@svta/cml-cmcd";
+import { encodeSfDict } from "@svta/cml-structured-field-values";
+
+const reporter = new CmcdReporter({
+	cid: "video-123",
+	eventTargets: [
+		{
+			sink: async (reports) => {
+				const lines = reports.map((report) => encodeSfDict(report, { whitespace: false }));
+				socket.send(lines.join("\n"));
+			},
+			events: [CmcdEventType.TIME_INTERVAL, CmcdEventType.ERROR],
+			enabledKeys: ["bl", "br", "ec", "sid"],
+		},
+	],
+});
+```
+
+The promise of the sink controls what the reporter does next:
+
+| Sink result                    | Reporter action                                                                 |
+| ------------------------------ | ------------------------------------------------------------------------------- |
+| Resolves                       | The batch is delivered.                                                         |
+| Resolves with `{ gone: true }` | Stops reporting to every target with the same sink for the rest of the session. |
+| Rejects or throws              | Queues the batch again and sends it on the next queue pass.                     |
+
+The `gone` result has the same effect as an HTTP 410 response from a collector. The sink must not mutate the reports, because a failed batch is sent again.
+
+## Batching by Time
+
+`batchSize` sends a batch when it contains a number of reports. `batchInterval` sends a batch when its first report has waited a number of seconds. If you set both options, the reporter sends the batch when the first limit is reached. If you set only `batchInterval`, the batch has no size limit.
+
+```typescript
+import { CmcdEventType, CmcdReporter } from "@svta/cml-cmcd";
+
+const reporter = new CmcdReporter({
+	eventTargets: [
+		{
+			url: "https://analytics.example.com/cmcd",
+			events: [CmcdEventType.PLAY_STATE, CmcdEventType.ERROR],
+			// Send at most one request per minute, or earlier at 20 reports.
+			batchInterval: 60,
+			batchSize: 20,
+		},
+	],
+});
+```
+
+`flush()` sends every batch at once and cancels the time limits. A session change sends the batches of the ended session.
+
 ## Filtering CMCD Keys
 
 The `enabledKeys` option limits which CMCD keys the reports include:
@@ -987,10 +1044,12 @@ A throw affects only the target whose transform threw. The other targets still r
 
 | Property      | Type              | Default     | Description                                                                 |
 | ------------- | ----------------- | ----------- | --------------------------------------------------------------------------- |
-| `url`         | `string`          | Required    | Analytics endpoint URL                                                      |
+| `url`         | `string`          | `undefined` | Collector URL. Set either `url` or `sink`.                                                     |
+| `sink`        | `CmcdEventSink`   | `undefined` | Delivers reports to a destination that is not HTTP. Set either `url` or `sink`. See [Custom Event Destinations](#custom-event-destinations). |
 | `events`      | `CmcdEventType[]` | `undefined` | Events to report. If no events are provided, the target is disabled.        |
 | `interval`    | `number`          | `30`        | Seconds between TIME_INTERVAL reports                                       |
 | `batchSize`   | `number`          | `1`         | Events to batch before sending                                              |
+| `batchInterval` | `number`        | `0`         | Seconds a batch waits before sending. `0` disables the time limit. See [Batching by Time](#batching-by-time). |
 | `version`     | `CmcdVersion`     | `CMCD_V2`   | CMCD version for this target (must be v2 or higher)                         |
 | `enabledKeys` | `CmcdKey[]`       | `undefined` | Keys to include for this target. If not provided, no keys will be reported. [Custom keys](#custom-keys) must be listed explicitly. |
 | `transform`   | `CmcdEventReportTransform` | `undefined` | Transforms or cancels each of this target's event reports. See [Typing `customData`](#typing-customdata). |

@@ -213,17 +213,34 @@ export type CmcdEvent = CmcdRequest & {
 };
 
 // @public
-export type CmcdEventReportConfig<C = Record<string, unknown>> = CmcdReportConfig & {
+export type CmcdEventReportConfig<C = Record<string, unknown>> = CmcdReportConfig & CmcdEventReportDestination & {
     version?: typeof CMCD_V2;
-    url: string;
     events?: CmcdEventType[];
     interval?: number;
     batchSize?: number;
+    batchInterval?: number;
     transform?: CmcdEventReportTransform<C>;
 };
 
 // @public
+export type CmcdEventReportDestination = {
+    url: string;
+    sink?: undefined;
+} | {
+    url?: undefined;
+    sink: CmcdEventSink;
+};
+
+// @public
 export type CmcdEventReportTransform<C = Record<string, unknown>> = (data: Cmcd, request: CmcdTransformRequest<C> | undefined) => Cmcd | null;
+
+// @public
+export type CmcdEventSink = (reports: readonly Cmcd[]) => Promise<CmcdEventSinkResult | void>;
+
+// @public
+export type CmcdEventSinkResult = {
+    readonly gone?: boolean;
+};
 
 // @public
 export type CmcdEventsValidationResult = CmcdValidationResult & {
