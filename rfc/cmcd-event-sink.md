@@ -168,21 +168,37 @@ The return type includes `void`. An `async` sink without a `return` statement, o
 
 1. **Meaning of `batchInterval`.** The MSF draft calls `batchInterval` the "minimum milliseconds before a new Group". This RFC reads it as the maximum wait of a batch, because the draft also says that either limit triggers a Group. Review must confirm this reading with the draft authors.
 2. **Scope of `gone`.** This RFC scopes `gone` to the sink function. An alternative is to scope it to the target only.
-3. **Package for the MSF layer.** See [Future possibilities](#future-possibilities).
+3. **Location of the MSF layer.** [Future possibilities](#future-possibilities) proposes a split between CML and the players. Review must confirm the split.
 
 ## Future possibilities
 
-An MSF mapping layer can build on the sink. Review should decide whether the layer is a new package, a module of `@svta/cml-cmcd`, or a guide. The draft is an individual draft, so this RFC proposes to wait until the draft is stable. The layer needs these parts:
+An MSF mapping layer can build on the sink. This RFC proposes to split the layer between CML and the players. The sink is the boundary between the two parts.
 
-| Part                       | Behavior                                                                                                              |
-| -------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| Configuration mapper       | Converts a `publishTracks` entry with `cmcdConfig` into a `CmcdEventReportConfig`. Converts milliseconds to seconds. |
-| Interval floor             | Raises an `interval` below 5000 milliseconds, as the security section of the draft asks.                              |
-| Key allowlist              | The 27 keys that the draft permits. A transform removes all other keys.                                                |
-| Event filter               | Rejects the `rr` and `h` events, which the draft forbids.                                                              |
-| Record serializer          | Converts a prepared report into `{ T, data }`, with the value of each key as a CMCD string that is not URL-encoded.   |
-| Group counter              | Starts at 0 for each session and increments by one for each batch.                                                    |
-| Validation                 | An MSF mode for `validateCmcdEventReport`.                                                                             |
+### Parts in CML
+
+These parts are pure functions of the draft. They do no I/O and have no dependencies. Without them, every MoQ player implements the same rules again.
+
+| Part                 | Behavior                                                                                                              |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Configuration mapper | Converts a `publishTracks` entry with `cmcdConfig` into a `CmcdEventReportConfig`. Converts milliseconds to seconds. |
+| Interval floor       | Raises an `interval` below 5000 milliseconds, as the security section of the draft asks.                              |
+| Key allowlist        | The 27 keys that the draft permits. A transform removes all other keys.                                                |
+| Event filter         | Rejects the `rr` and `h` events, which the draft forbids.                                                              |
+| Record serializer    | Converts a prepared report into `{ T, data }`, with the value of each key as a CMCD string that is not URL-encoded.   |
+| Validation           | An MSF mode for `validateCmcdEventReport`.                                                                             |
+
+### Parts in the players
+
+These parts need a MoQ session or the state of the catalog. CML has no MoQ transport, and a transport dependency would reach adopters who do not use MoQ.
+
+- The MoQ session and the publication of the tracks.
+- The parse of `publishTracks` from the catalog, and the substitution of variables such as `%player-id%`.
+- The track tokens.
+- The Group IDs. A Group ID starts at 0 for each session and increments by one for each batch.
+
+### Timing and location
+
+The draft is an individual draft. This RFC proposes to add the CML parts only when the draft is stable. Until then, a guide shows a sink for MSF. The CML parts can start as a module of `@svta/cml-cmcd`. If several players parse MSF catalogs, a later `@svta/cml-msf` package can hold the catalog types and the CMCD mapping.
 
 The draft has these inconsistencies, which the authors must resolve before the record serializer is final:
 
