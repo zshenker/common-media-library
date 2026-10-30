@@ -1177,7 +1177,7 @@ const reporter = new CmcdReporter(
 
 An event target sends its reports to a collector `url` as HTTP POST requests. To send event reports over a transport that is not HTTP, give the target a `sink` instead of a `url`. Examples of such transports are WebSocket and Media over QUIC. A target has either a `url` or a `sink`, never both.
 
-The reporter calls the sink with each batch of reports. Each report is prepared CMCD data, in the same form that `prepareCmcdData` returns. The reporter has already applied `enabledKeys`, the `transform`, and the session keys. The timestamp is in its own key, `ts`, so the sink can move it into the time index of its transport.
+The reporter calls the sink with each batch of reports. Each report is prepared CMCD data, in the same form that `prepareCmcdData` returns. The reporter has already applied `enabledKeys`, the `transform`, and the session keys. A token value is an `SfToken` instance, so serialize the report with `encodeSfDict` and not with `JSON.stringify`. The timestamp is in its own key, `ts`. A sink can read `ts` and write it to the time index of its transport.
 
 ```typescript
 import { CmcdEventType, CmcdReporter } from "@svta/cml-cmcd";
@@ -1204,9 +1204,18 @@ The promise of the sink controls what the reporter does next:
 | ------------------------------ | ------------------------------------------------------------------------------- |
 | Resolves                       | The batch is delivered.                                                         |
 | Resolves with `{ gone: true }` | Stops reporting to every target with the same sink for the rest of the session. |
-| Rejects or throws              | Queues the batch again and sends it on the next queue pass.                     |
+| Rejects or throws              | Queues the batch again. See the retry rules below.                              |
 
-The `gone` result has the same effect as an HTTP 410 response from a collector. The sink must not mutate the reports, because a failed batch is sent again.
+The `gone` result has the same effect as an HTTP 410 response from a collector. "The same sink" means the same function reference. Two inline arrow functions are two different sinks.
+
+A rejected batch is sent again:
+
+- If the target has a `batchInterval`, the reporter sends the batch again after one interval.
+- Otherwise, the reporter sends the batch with the next batch of the target, or on `flush()`.
+
+The reporter never drops a rejected batch. To drop a batch that can never succeed, resolve the promise. A retry can merge a failed batch with later reports. A retry can also arrive after a batch that was sent later. Use `sn` to order the reports and to detect duplicates. Assign transport sequence numbers, such as MOQT Group IDs, when the sink publishes.
+
+Each call of the sink receives its own copy of the reports. A sink that changes a report does not change the data store, the reports of other targets, or a retry.
 
 ## Batching by Time
 
@@ -1220,7 +1229,7 @@ const reporter = new CmcdReporter({
 		{
 			url: "https://analytics.example.com/cmcd",
 			events: [CmcdEventType.PLAY_STATE, CmcdEventType.ERROR],
-			// Send at most one request per minute, or earlier at 20 reports.
+			// Send a report at most 60 seconds after it is queued, or earlier at 20 reports.
 			batchInterval: 60,
 			batchSize: 20,
 		},
@@ -1228,7 +1237,9 @@ const reporter = new CmcdReporter({
 });
 ```
 
-`flush()` sends every batch at once and cancels the time limits. A session change sends the batches of the ended session.
+If the time limit ends and the queue holds more than `batchSize` reports, the reporter sends them in batches of at most `batchSize`. A report that remains in the queue keeps its own time limit.
+
+`flush()` sends every batch at once and cancels the time limits. A session change sends the batches of the ended session. `stop()` cancels the time limits. The queued reports wait for `flush()`, for `start()`, or for a batch that reaches `batchSize`. A value above 2,147,483 seconds (about 24.8 days) is reduced to that limit.
 
 ## Filtering CMCD Keys
 
@@ -1443,7 +1454,7 @@ A throw affects only the target whose transform threw. The other targets still r
 | `events`      | `CmcdEventType[]` | `undefined` | Events to report. If no events are provided, the target is disabled.        |
 | `interval`    | `number`          | `30`        | Seconds between TIME_INTERVAL reports                                       |
 | `batchSize`   | `number`          | `1`         | Events to batch before sending                                              |
-| `batchInterval` | `number`        | `0`         | Seconds a batch waits before sending. `0` disables the time limit. See [Batching by Time](#batching-by-time). |
+| `batchInterval` | `number`        | `0`         | Maximum seconds a report waits in a batch. `0` disables the time limit. See [Batching by Time](#batching-by-time). |
 | `version`     | `CmcdVersion`     | `CMCD_V2`   | CMCD version for this target (must be v2 or higher)                         |
 | `enabledKeys` | `CmcdKey[]`       | `undefined` | Keys to include for this target. If not provided, no keys will be reported. [Custom keys](#custom-keys) must be listed explicitly. |
 | `transform`   | `CmcdEventReportTransform` | `undefined` | Transforms or cancels each of this target's event reports. See [Typing `customData`](#typing-customdata). |
@@ -1945,7 +1956,7 @@ export type CmcdEventReportDestination = {
 export type CmcdEventReportTransform<C = Record<string, unknown>> = (data: Cmcd, request: CmcdTransformRequest<C> | undefined) => Cmcd | null;
 
 // @public
-export type CmcdEventSink = (reports: readonly Cmcd[]) => Promise<CmcdEventSinkResult | void>;
+export type CmcdEventSink = (reports: readonly Readonly<Cmcd>[]) => Promise<CmcdEventSinkResult | void>;
 
 // @public
 export type CmcdEventSinkResult = {

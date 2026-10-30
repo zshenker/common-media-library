@@ -5328,6 +5328,96 @@ describe('CmcdReporter', () => {
 			equal(delivered.length, 2)
 		})
 
+		it('gives the sink reports that share no values with the data store or other targets', async () => {
+			const KEY = 'com.example-arr' as CmcdKey
+			const second: Readonly<Cmcd>[] = []
+			const reporter = new CmcdReporter({
+				sid: 's',
+				eventTargets: [
+					{
+						sink: reports => {
+							for (const report of reports) {
+								;((report as Record<string, unknown>)[KEY] as unknown[]).push(99)
+							}
+							return Promise.resolve()
+						},
+						events: [CmcdEventType.ERROR],
+						enabledKeys: [KEY],
+					},
+					{
+						sink: reports => {
+							second.push(...reports)
+							return Promise.resolve()
+						},
+						events: [CmcdEventType.ERROR],
+						enabledKeys: [KEY],
+					},
+				],
+			})
+
+			reporter.update({ [KEY]: [1] })
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await new Promise(resolve => setTimeout(resolve, 10))
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await new Promise(resolve => setTimeout(resolve, 10))
+
+			deepEqual((second[0] as Record<string, unknown>)[KEY], [1])
+			deepEqual((second[1] as Record<string, unknown>)[KEY], [1])
+		})
+
+		it('keeps a queued sink report unchanged when the player mutates its own value', async () => {
+			const KEY = 'com.example-arr' as CmcdKey
+			const delivered: Readonly<Cmcd>[] = []
+			const list = [1]
+			const reporter = new CmcdReporter({
+				sid: 's',
+				eventTargets: [
+					{
+						sink: reports => {
+							delivered.push(...reports)
+							return Promise.resolve()
+						},
+						events: [CmcdEventType.ERROR],
+						enabledKeys: [KEY],
+						batchSize: 2,
+					},
+				],
+			})
+
+			reporter.recordEvent(CmcdEventType.ERROR, { [KEY]: list })
+			list.push(2)
+			reporter.flush()
+			await new Promise(resolve => setTimeout(resolve, 10))
+
+			deepEqual((delivered[0] as Record<string, unknown>)[KEY], [1])
+		})
+
+		it('sends a retry with the original reports when the sink mutated them', async () => {
+			const timestamps: unknown[] = []
+			let calls = 0
+			const sink: CmcdEventSink = reports => {
+				for (const report of reports) {
+					timestamps.push(report.ts)
+					delete (report as Cmcd).ts
+				}
+				return calls++ === 0 ? Promise.reject(new Error('offline')) : Promise.resolve()
+			}
+
+			const reporter = new CmcdReporter({
+				sid: 's',
+				eventTargets: [{ sink, events: [CmcdEventType.ERROR], enabledKeys: ['sid'] }],
+			})
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await new Promise(resolve => setTimeout(resolve, 10))
+			reporter.flush()
+			await new Promise(resolve => setTimeout(resolve, 10))
+
+			equal(timestamps.length, 2)
+			equal(typeof timestamps[1], 'number')
+			equal(timestamps[1], timestamps[0])
+		})
+
 		it('rejects a target with both a url and a sink at compile time', () => {
 			const sink: CmcdEventSink = () => Promise.resolve()
 			// @ts-expect-error A target has either a url or a sink, never both.
@@ -5443,6 +5533,224 @@ describe('CmcdReporter', () => {
 			equal(requests.length, 1)
 			ok((requests[0].body as string).includes('sid="test-session"'))
 			equal(vi.getTimerCount(), 0)
+		})
+
+		it('sends a failed batch again after one interval when no other event arrives', async () => {
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+			let calls = 0
+			const sink: CmcdEventSink = () =>
+				calls++ === 0 ? Promise.reject(new Error('offline')) : Promise.resolve()
+			const reporter = new CmcdReporter({
+				sid: 's',
+				eventTargets: [
+					{ sink, events: [CmcdEventType.ERROR], enabledKeys: ['sid'], batchInterval: 5 },
+				],
+			})
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			vi.advanceTimersByTime(5_000)
+			for (let i = 0; i < 5; i++) await Promise.resolve()
+			equal(calls, 1)
+			equal(vi.getTimerCount(), 1)
+
+			vi.advanceTimersByTime(5_000)
+			for (let i = 0; i < 5; i++) await Promise.resolve()
+			equal(calls, 2)
+			equal(vi.getTimerCount(), 0)
+		})
+
+		it('sends the queue in batches of at most batchSize when the time limit ends', async () => {
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+			const sizes: number[] = []
+			const pending: (() => void)[] = []
+			const reporter = new CmcdReporter({
+				sid: 's',
+				eventTargets: [
+					{
+						sink: reports => {
+							sizes.push(reports.length)
+							return new Promise((resolve, reject) =>
+								pending.push(sizes.length === 1 ? () => reject(new Error('x')) : resolve),
+							)
+						},
+						events: [CmcdEventType.ERROR],
+						enabledKeys: ['sid'],
+						batchSize: 2,
+						batchInterval: 60,
+					},
+				],
+			})
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			reporter.recordEvent(CmcdEventType.ERROR)
+			reporter.recordEvent(CmcdEventType.ERROR)
+
+			// The first batch fails while the third report waits.
+			pending[0]()
+			for (let i = 0; i < 5; i++) await Promise.resolve()
+
+			vi.advanceTimersByTime(60_000)
+			for (let i = 0; i < 5; i++) await Promise.resolve()
+
+			deepEqual(sizes, [2, 2, 1])
+		})
+
+		it('sends a leftover report at its own deadline, not one interval after the send', async () => {
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+			const sizes: number[] = []
+			const reporter = new CmcdReporter({
+				sid: 's',
+				eventTargets: [
+					{
+						sink: reports => {
+							sizes.push(reports.length)
+							return sizes.length === 1 ? Promise.reject(new Error('x')) : Promise.resolve()
+						},
+						events: [CmcdEventType.ERROR],
+						enabledKeys: ['sid'],
+						batchSize: 3,
+						batchInterval: 60,
+					},
+				],
+			})
+
+			// Three reports reach batchSize. The send fails and re-queues them.
+			reporter.recordEvent(CmcdEventType.ERROR)
+			reporter.recordEvent(CmcdEventType.ERROR)
+			reporter.recordEvent(CmcdEventType.ERROR)
+			for (let i = 0; i < 5; i++) await Promise.resolve()
+
+			// Queued at 20 s, so its deadline is 80 s.
+			vi.advanceTimersByTime(20_000)
+			reporter.recordEvent(CmcdEventType.ERROR)
+
+			// The fifth report fills a batch of three. Two reports are left.
+			vi.advanceTimersByTime(20_000)
+			reporter.recordEvent(CmcdEventType.ERROR)
+			for (let i = 0; i < 5; i++) await Promise.resolve()
+			deepEqual(sizes, [3, 3])
+
+			vi.advanceTimersByTime(39_000)
+			for (let i = 0; i < 5; i++) await Promise.resolve()
+			deepEqual(sizes, [3, 3])
+
+			vi.advanceTimersByTime(1_000)
+			for (let i = 0; i < 5; i++) await Promise.resolve()
+			deepEqual(sizes, [3, 3, 2])
+		})
+
+		it('cancels the time limit on stop and arms it again on start', async () => {
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+			const { reporter, requests } = createBatchReporter()
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			reporter.stop()
+			equal(vi.getTimerCount(), 0)
+
+			vi.advanceTimersByTime(120_000)
+			await Promise.resolve()
+			equal(requests.length, 0)
+
+			reporter.start()
+			equal(vi.getTimerCount(), 1)
+
+			vi.advanceTimersByTime(60_000)
+			await Promise.resolve()
+			equal(requests.length, 1)
+		})
+
+		it('arms no time limit after stop for a report recorded while stopped', () => {
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+			const { reporter } = createBatchReporter()
+
+			reporter.stop()
+			reporter.recordEvent(CmcdEventType.ERROR)
+
+			equal(vi.getTimerCount(), 0)
+		})
+
+		it('drops the retry timer of a session that is evicted', async () => {
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+			const batches: (readonly Readonly<Cmcd>[])[] = []
+			const reporter = new CmcdReporter({
+				sid: 's1',
+				sessionRetention: 0,
+				eventTargets: [
+					{
+						sink: reports => {
+							batches.push(reports)
+							return Promise.reject(new Error('offline'))
+						},
+						events: [CmcdEventType.ERROR],
+						enabledKeys: ['sid'],
+						batchInterval: 5,
+					},
+				],
+			})
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			vi.advanceTimersByTime(5_000)
+			for (let i = 0; i < 5; i++) await Promise.resolve()
+			equal(batches.length, 1)
+
+			// s1 has a retry timer. Retention 0 evicts s1 at the sid change.
+			reporter.update({ sid: 's2' })
+			for (let i = 0; i < 5; i++) await Promise.resolve()
+			const sent = batches.length
+			equal(vi.getTimerCount(), 0)
+
+			vi.advanceTimersByTime(60_000)
+			for (let i = 0; i < 5; i++) await Promise.resolve()
+			equal(batches.length, sent)
+		})
+
+		it('caps a batch interval that is too large for a timer', async () => {
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+			for (const batchInterval of [Infinity, 1e12]) {
+				const { requester, requests } = createMockRequester()
+				const reporter = new CmcdReporter(
+					createConfig({
+						eventTargets: [
+							{
+								url: 'https://example.com/cmcd',
+								events: [CmcdEventType.ERROR],
+								enabledKeys: [...EVENT_KEYS],
+								batchInterval,
+							},
+						],
+					}),
+					requester,
+				)
+
+				reporter.recordEvent(CmcdEventType.ERROR)
+				vi.advanceTimersByTime(1_000)
+				await Promise.resolve()
+
+				equal(requests.length, 0, `batchInterval ${batchInterval}`)
+				reporter.stop()
+			}
+		})
+
+		it('ignores a batch interval of NaN', async () => {
+			const { requester, requests } = createMockRequester()
+			const reporter = new CmcdReporter(
+				createConfig({
+					eventTargets: [
+						{
+							url: 'https://example.com/cmcd',
+							events: [CmcdEventType.ERROR],
+							enabledKeys: [...EVENT_KEYS],
+							batchInterval: NaN,
+						},
+					],
+				}),
+				requester,
+			)
+
+			reporter.recordEvent(CmcdEventType.ERROR)
+			await new Promise(resolve => setTimeout(resolve, 10))
+
+			equal(requests.length, 1)
 		})
 
 		it('ignores a batch interval that is not a positive number', async () => {

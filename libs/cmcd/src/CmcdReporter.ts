@@ -57,6 +57,12 @@ type CmcdReporterConfigNormalized<C> = CmcdReporterConfig<C> &
 		sessionRetention: number
 	}
 
+/**
+ * The largest `batchInterval` in seconds. `setTimeout` fires at once for a
+ * delay above 2^31 - 1 milliseconds.
+ */
+const CMCD_MAX_BATCH_INTERVAL = 2_147_483
+
 function createEncodingOptions(
 	reportingMode: CmcdReportingMode,
 	config: CmcdReportConfig & Pick<CmcdRequestReportConfig, 'customHeaderMap'>,
@@ -259,6 +265,15 @@ function copyReportValues(data: Cmcd): Cmcd {
 }
 
 /**
+ * Cancels the batch timer of an event target. Safe to call when no timer is
+ * armed.
+ */
+function clearBatchTimer(target: CmcdEventTarget): void {
+	clearTimeout(target.batchTimer)
+	target.batchTimer = undefined
+}
+
+/**
  * Decodes the per-call data snapshot of a provenance record into new,
  * encodable report data. Tokens decode as `SfToken` and items with params
  * as `SfItem` (`useSymbol: false`), so every value re-encodes with its
@@ -341,9 +356,11 @@ function createCmcdReporterConfig<C>(
 				return acc
 			}
 
+			// NaN fails the comparison. A larger value than `setTimeout` accepts
+			// would fire at once, so the reporter caps it.
 			const batchInterval =
 				typeof target.batchInterval === 'number' && target.batchInterval > 0
-					? target.batchInterval
+					? Math.min(target.batchInterval, CMCD_MAX_BATCH_INTERVAL)
 					: 0
 
 			acc.push({
@@ -369,12 +386,17 @@ type CmcdTarget = {
 }
 
 /**
- * One queued event report: the prepared data that a sink receives, and the
- * encoded line that an HTTP collector receives.
+ * One queued event report. A URL target stores the encoded line that the
+ * collector receives. A sink target stores the prepared data, detached from
+ * the data store and from the reports of other targets.
  */
 type CmcdQueuedReport = {
-	data: Cmcd
-	line: string
+	report: string | Cmcd
+	/**
+	 * The time in milliseconds when the report entered the queue. The batch
+	 * time limit counts from the oldest report.
+	 */
+	queuedAt: number
 }
 
 type CmcdEventTarget = CmcdTarget & {
@@ -457,6 +479,12 @@ export class CmcdReporter<C = Record<string, unknown>> {
 	private intervals = new Map<CmcdEventReportConfigNormalized<C>, ReturnType<typeof setInterval>>()
 	private started = false
 
+	/**
+	 * Set by `stop()` and cleared by `start()`. A stopped reporter arms no
+	 * batch timers. Reporting before the first `start()` is allowed.
+	 */
+	private stopped = false
+
 	private requester: (request: HttpRequest) => Promise<{ status: number }>
 
 	/**
@@ -524,6 +552,7 @@ export class CmcdReporter<C = Record<string, unknown>> {
 	 */
 	start(): void {
 		this.started = true
+		this.stopped = false
 
 		// The initial time-interval event is fired synchronously per target, so a
 		// throwing transform must not abort the loop: later targets would never
@@ -557,6 +586,9 @@ export class CmcdReporter<C = Record<string, unknown>> {
 				failure ??= { error }
 			}
 		})
+
+		// Re-arms the batch timers that `stop()` cancelled.
+		this.processEventTargets()
 
 		if (failure) {
 			throw failure.error
@@ -594,10 +626,15 @@ export class CmcdReporter<C = Record<string, unknown>> {
 	 * Stops the CMCD reporter. The player calls this method when it disables the
 	 * reporter.
 	 *
+	 * The method stops the time-interval events and cancels the `batchInterval`
+	 * time limits. Without `flush`, queued reports wait for `flush()`, for
+	 * `start()`, or for the next batch that reaches `batchSize`.
+	 *
 	 * @param flush - Whether to flush the event targets.
 	 */
 	stop(flush: boolean = false): void {
 		this.started = false
+		this.stopped = true
 
 		if (flush) {
 			this.flush()
@@ -606,6 +643,10 @@ export class CmcdReporter<C = Record<string, unknown>> {
 		for (const config of this.config.eventTargets) {
 			this.disarmInterval(config)
 		}
+
+		this.sessions.forEach(session => {
+			session.eventTargets.forEach(clearBatchTimer)
+		})
 	}
 
 	/**
@@ -750,6 +791,7 @@ export class CmcdReporter<C = Record<string, unknown>> {
 				break
 			}
 
+			this.sessions.get(key)?.eventTargets.forEach(clearBatchTimer)
 			this.sessions.delete(key)
 		}
 
@@ -1001,7 +1043,14 @@ export class CmcdReporter<C = Record<string, unknown>> {
 		}
 
 		const data = prepareCmcdData(report, createEncodingOptions(CMCD_EVENT_MODE, config))
-		target.queue.push({ data, line: encodePreparedCmcd(data) })
+		const line = encodePreparedCmcd(data)
+
+		// The prepared data shares nested values with the data store and with
+		// the reports of other targets, so a sink target keeps its own copy.
+		target.queue.push({
+			report: config.sink ? copyReportValues(data) : line,
+			queuedAt: Date.now(),
+		})
 	}
 
 	/**
@@ -1347,15 +1396,22 @@ export class CmcdReporter<C = Record<string, unknown>> {
 	}
 
 	/**
-	 * Sends the ready batch of one event target. If the batch is not ready
-	 * and the target has a `batchInterval`, the method starts the batch timer.
-	 * Returns whether reports remain in the queue after the send.
+	 * Sends the ready batch of one event target. A batch is ready when it
+	 * reaches `batchSize`, or when its oldest report reaches `batchInterval`.
+	 * If the batch is not ready, the method starts the batch timer. Returns
+	 * whether reports remain in the queue after the send.
+	 *
+	 * @param drain - Send every queued report in one batch. `flush()` and the
+	 *                drain of an ended session use this mode.
+	 * @param expired - Treat the oldest report as past its time limit. The
+	 *                  batch timer uses this mode.
 	 */
 	private processEventTarget(
 		session: CmcdSession<C>,
 		target: CmcdEventTarget,
 		config: CmcdEventReportConfigNormalized<C>,
 		drain: boolean,
+		expired: boolean = false,
 	): boolean {
 		const { queue } = target
 
@@ -1365,33 +1421,83 @@ export class CmcdReporter<C = Record<string, unknown>> {
 			return false
 		}
 
-		if (queue.length < config.batchSize && !drain) {
-			// Only an archived session drains, and an archived session always
-			// drains, so the timer only ever reports into its own session.
-			if (config.batchInterval && target.batchTimer === undefined) {
-				target.batchTimer = setTimeout(() => {
-					target.batchTimer = undefined
-					this.processEventTarget(session, target, config, true)
-				}, config.batchInterval * 1000)
-			}
+		if (!drain) {
+			const { batchInterval } = config
 
-			return false
+			expired ||= batchInterval > 0 && Date.now() - queue[0].queuedAt >= batchInterval * 1000
+
+			if (queue.length < config.batchSize && !expired) {
+				this.armBatchTimer(session, target, config)
+				return false
+			}
 		}
 
-		// The next batch starts its own time limit with its first report.
-		clearTimeout(target.batchTimer)
-		target.batchTimer = undefined
+		clearBatchTimer(target)
 
-		const deleteCount = drain ? queue.length : config.batchSize
-		const reports = queue.splice(0, deleteCount)
+		// `batchSize` is `Infinity` for a target with a time limit only.
+		const reports = queue.splice(0, drain ? queue.length : Math.min(queue.length, config.batchSize))
+
 		this.sendEventReport(session, config, reports).catch(() => {
 			// Re-queue events that failed to send. The target belongs
 			// to the batch's own session, so a failure after a session
 			// change re-queues there, never into the current session.
 			target.queue.unshift(...reports)
+
+			// Without a new timer, a target with a time limit only would
+			// keep the batch until the next event. The retry waits one full
+			// interval, so a collector that stays down gets no hot loop.
+			this.armBatchTimer(session, target, config, config.batchInterval * 1000)
 		})
 
 		return queue.length > 0
+	}
+
+	/**
+	 * Starts the batch timer of a target that has a `batchInterval`, unless a
+	 * timer is already armed or the reporter is stopped. The timer sends the
+	 * queue in batches of at most `batchSize` reports.
+	 *
+	 * @param delay - The delay in milliseconds. Defaults to the time left
+	 *                before the oldest report reaches `batchInterval`.
+	 */
+	private armBatchTimer(
+		session: CmcdSession<C>,
+		target: CmcdEventTarget,
+		config: CmcdEventReportConfigNormalized<C>,
+		delay?: number,
+	): void {
+		const { queue } = target
+
+		if (
+			!config.batchInterval ||
+			target.batchTimer !== undefined ||
+			target.disposed ||
+			this.stopped ||
+			!queue.length ||
+			// A send of an evicted session can fail after the eviction.
+			this.sessions.get(session.sid) !== session
+		) {
+			return
+		}
+
+		delay ??= Math.max(0, config.batchInterval * 1000 - (Date.now() - queue[0].queuedAt))
+
+		target.batchTimer = setTimeout(() => {
+			target.batchTimer = undefined
+
+			// An evicted session's unsent queues die with it.
+			if (this.sessions.get(session.sid) !== session) {
+				return
+			}
+
+			// The first pass sends the expired batch. Later passes send the
+			// leftovers that are ready, or arm the timer for the next one.
+			let expired = true
+
+			while (this.processEventTarget(session, target, config, false, expired)) {
+				expired = false
+			}
+		}, delay)
 	}
 
 	/**
@@ -1407,8 +1513,12 @@ export class CmcdReporter<C = Record<string, unknown>> {
 		reports: CmcdQueuedReport[],
 	): Promise<void> {
 		if (config.sink) {
-			// A rejection propagates, so the caller re-queues the batch.
-			const result = await config.sink(reports.map(report => report.data))
+			// Each call gets its own copy, so a sink that mutates a report
+			// cannot change the batch that a retry sends again. A rejection
+			// propagates, so the caller re-queues the batch.
+			const result = await config.sink(
+				reports.map(({ report }) => copyReportValues({ ...(report as Cmcd) })),
+			)
 
 			if (result?.gone === true) {
 				this.disposeEventTarget(session, config)
@@ -1423,7 +1533,7 @@ export class CmcdReporter<C = Record<string, unknown>> {
 			headers: {
 				'Content-Type': CMCD_MIME_TYPE,
 			},
-			body: reports.map(report => report.line).join('\n'),
+			body: reports.map(({ report }) => report as string).join('\n'),
 		})
 
 		const { status } = response
@@ -1473,8 +1583,7 @@ export class CmcdReporter<C = Record<string, unknown>> {
 
 			target.disposed = true
 			target.queue.length = 0
-			clearTimeout(target.batchTimer)
-			target.batchTimer = undefined
+			clearBatchTimer(target)
 
 			// The timer belongs to the live session only; an archived session's
 			// disposal is bookkeeping and must not silence current reporting.

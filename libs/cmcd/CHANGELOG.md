@@ -10,12 +10,15 @@ and this project adheres to
 
 ### Added
 
-- An event target can have a `sink` instead of a `url`. A `CmcdEventSink` receives each batch as prepared CMCD data and delivers the batch over a transport that is not HTTP, for example Media over QUIC. A sink resolves with `{ gone: true }` to stop reporting for the rest of the session, like an HTTP 410 response. A rejected sink promise queues the batch again. See the [RFC](https://github.com/streaming-video-technology-alliance/common-media-library/blob/main/rfc/cmcd-event-sink.md).
-- The `batchInterval` option of an event target sends a batch when its first report has waited the given number of seconds. If `batchSize` is also set, the first limit that the batch reaches sends the batch.
+- An event target can have a `sink` instead of a `url`. A `CmcdEventSink` receives each batch as prepared CMCD data and delivers the batch over a transport that is not HTTP, for example Media over QUIC. A sink resolves with `{ gone: true }` to stop reporting for the rest of the session, like an HTTP 410 response. A rejected sink promise queues the batch again. Each sink call receives its own copy of the reports. See the [RFC](https://github.com/streaming-video-technology-alliance/common-media-library/blob/main/rfc/cmcd-event-sink.md).
+- The `batchInterval` option of an event target sends a batch when its oldest report has waited the given number of seconds. If `batchSize` is also set, the first limit that the batch reaches sends the batch. A failed batch of such a target is sent again after one interval. `stop()` cancels the time limits, and `start()` starts them again.
 
 ### Changed
 
-- The `url` property of `CmcdEventReportConfig` is now optional in the type, because a target has either a `url` or a `sink`. Code that only creates configurations needs no change. Code that reads `url` from a `CmcdEventReportConfig` value now gets `string | undefined`. Narrow the value with `if (config.url)` before you use it.
+- `CmcdEventReportConfig` is now a union type, because a target has either a `url` or a `sink`. Runtime behavior does not change. Code that only creates configurations needs no change. These patterns need a change:
+  - Code that reads `url` from a `CmcdEventReportConfig` value gets `string | undefined`. Narrow the value with `if (config.url)` before you use it.
+  - `interface MyTarget extends CmcdEventReportConfig {}` no longer compiles, because an interface cannot extend a union. Use `type MyTarget = CmcdEventReportConfig & {}`.
+  - `Omit<CmcdEventReportConfig, 'url'>` and `Partial<CmcdEventReportConfig>` keep the `sink` member. A spread of such a value with a new `url` no longer compiles. Remove the destination first: `Omit<CmcdEventReportConfig, 'url' | 'sink'>`.
 
 ## [2.8.4] - 2026-10-26
 

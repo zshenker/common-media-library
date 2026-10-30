@@ -235,7 +235,7 @@ export type CmcdEventReportDestination = {
 export type CmcdEventReportTransform<C = Record<string, unknown>> = (data: Cmcd, request: CmcdTransformRequest<C> | undefined) => Cmcd | null;
 
 // @public
-export type CmcdEventSink = (reports: readonly Cmcd[]) => Promise<CmcdEventSinkResult | void>;
+export type CmcdEventSink = (reports: readonly Readonly<Cmcd>[]) => Promise<CmcdEventSinkResult | void>;
 
 // @public
 export type CmcdEventSinkResult = {
